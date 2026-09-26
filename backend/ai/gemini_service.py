@@ -30,6 +30,8 @@ def _get_client():
 def analyze_document_text(extracted_text):
     """
     Analyze uploaded medical document using Gemini.
+
+    Retries temporary 503/429 errors automatically.
     """
 
     client = _get_client()
@@ -39,31 +41,57 @@ def analyze_document_text(extracted_text):
         "gemini-3.8-flash"
     )
 
-    try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=build_user_prompt(extracted_text),
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                temperature=0.2,
-            ),
-        )
+    prompt = build_user_prompt(extracted_text)
+    last_error = None
 
-        text = getattr(response, "text", None)
-
-        if not text:
-            raise GeminiServiceError(
-                "Gemini returned an empty response."
+    # Total 4 attempts:
+    # 1st attempt + 3 retries
+    for attempt in range(1, 5):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    temperature=0.2,
+                ),
             )
 
-        return text
+            text = getattr(response, "text", None)
 
-    except Exception as e:
-        raise GeminiServiceError(
-            f"Gemini document analysis failed "
-            f"(model={model_name}): {type(e).__name__}: {e}"
-        ) from e
+            if not text:
+                raise GeminiServiceError(
+                    "Gemini returned an empty response."
+                )
+
+            return text
+
+        except Exception as e:
+            last_error = e
+            error_text = str(e)
+
+            # Retry only temporary Gemini errors
+            retryable = (
+                "503" in error_text
+                or "UNAVAILABLE" in error_text
+                or "429" in error_text
+                or "RESOURCE_EXHAUSTED" in error_text
+            )
+
+            if retryable and attempt < 4:
+                # Wait: 2s, 4s, 8s
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+                continue
+
+            break
+
+    raise GeminiServiceError(
+        f"Gemini document analysis failed "
+        f"(model={model_name}): "
+        f"{type(last_error).__name__}: {last_error}"
+    ) from last_error
 
 
 CHAT_SYSTEM_PROMPT = """
