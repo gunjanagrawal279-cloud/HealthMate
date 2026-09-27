@@ -27,72 +27,156 @@ def _get_client():
     return genai.Client(api_key=_get_api_key())
 
 
+def _clean_json_text(text):
+    """
+    Clean Gemini response before JSON parsing.
+    Handles normal JSON and markdown code fences.
+    """
+
+    if not text:
+        return ""
+
+    cleaned = text.strip()
+
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+
+    return cleaned.strip()
+
+
+def _is_retryable_error(error):
+    """
+    Return True for temporary Gemini/API errors.
+    """
+
+    error_text = str(error).upper()
+
+    retryable_keywords = [
+        "503",
+        "UNAVAILABLE",
+        "429",
+        "RESOURCE_EXHAUSTED",
+        "500",
+        "502",
+        "504",
+        "INTERNAL",
+        "TIMEOUT",
+    ]
+
+    return any(
+        keyword in error_text
+        for keyword in retryable_keywords
+    )
+
+
 def analyze_document_text(extracted_text):
     """
-    Analyze uploaded medical document using Gemini.
+    Analyze uploaded health document using Gemini.
 
-    Retries temporary 503/429 errors automatically.
+    Always returns a Python dictionary.
     """
 
     client = _get_client()
 
-    model_name = os.environ.get(
+    primary_model = os.environ.get(
         "GEMINI_MODEL",
-        "gemini-3.8-flash"
+        "gemini-3.5-flash-lite",
     )
 
+    fallback_model = "gemini-3.8-flash"
+
+    models_to_try = [primary_model]
+
+    if fallback_model not in models_to_try:
+        models_to_try.append(fallback_model)
+
     prompt = build_user_prompt(extracted_text)
+
     last_error = None
 
-    # Total 4 attempts:
-    # 1st attempt + 3 retries
-    for attempt in range(1, 5):
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    response_mime_type="application/json",
-                    temperature=0.2,
-                ),
-            )
+    for model_name in models_to_try:
 
-            text = getattr(response, "text", None)
+        for attempt in range(1, 4):
 
-            if not text:
-                raise GeminiServiceError(
-                    "Gemini returned an empty response."
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        response_mime_type="application/json",
+                        max_output_tokens=4096,
+                    ),
                 )
 
-            return text
+                text = getattr(response, "text", None)
 
-        except Exception as e:
-            last_error = e
-            error_text = str(e)
+                if not text:
+                    raise GeminiServiceError(
+                        f"Gemini returned an empty response "
+                        f"(model={model_name})."
+                    )
 
-            # Retry only temporary Gemini errors
-            retryable = (
-                "503" in error_text
-                or "UNAVAILABLE" in error_text
-                or "429" in error_text
-                or "RESOURCE_EXHAUSTED" in error_text
-            )
+                cleaned = _clean_json_text(text)
 
-            if retryable and attempt < 4:
-                # Wait: 2s, 4s, 8s
-                wait_time = 2 ** attempt
-                time.sleep(wait_time)
-                continue
+                try:
+                    parsed = json.loads(cleaned)
 
-            break
+                except json.JSONDecodeError as e:
+                    raise GeminiServiceError(
+                        "Gemini returned invalid JSON for document analysis."
+                    ) from e
+
+                if not isinstance(parsed, dict):
+                    raise GeminiServiceError(
+                        "Gemini returned an unexpected JSON structure."
+                    )
+
+                return parsed
+
+            except GeminiServiceError as e:
+                last_error = e
+
+                # JSON/format errors should not be retried repeatedly.
+                error_text = str(e)
+
+                if "invalid JSON" in error_text.lower():
+                    break
+
+                if attempt < 3:
+                    time.sleep(2 * attempt)
+                    continue
+
+                break
+
+            except Exception as e:
+                last_error = e
+
+                if _is_retryable_error(e) and attempt < 3:
+                    time.sleep(2 * attempt)
+                    continue
+
+                break
 
     raise GeminiServiceError(
-        f"Gemini document analysis failed "
-        f"(model={model_name}): "
-        f"{type(last_error).__name__}: {last_error}"
-    ) from last_error
+        "Gemini document analysis failed. "
+        f"Models tried: {', '.join(models_to_try)}. "
+        f"Last error: {type(last_error).__name__}: {last_error}"
+    )
 
+
+# ============================================================
+# CHAT / ASK HEALTHMATE
+# ============================================================
 
 CHAT_SYSTEM_PROMPT = """
 You are HealthMate AI, a helpful health-report assistant.
@@ -100,6 +184,7 @@ You are HealthMate AI, a helpful health-report assistant.
 Your job is to answer questions about the user's uploaded health report.
 
 IMPORTANT RULES:
+
 1. Use only the information provided in REPORT CONTEXT.
 2. Do not invent medical values.
 3. If the requested information is not present in the report,
@@ -128,8 +213,7 @@ def _generate_chat_response(
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=CHAT_SYSTEM_PROMPT,
-            temperature=0.2,
-            max_output_tokens=512,
+            max_output_tokens=1024,
         ),
     )
 
@@ -137,7 +221,7 @@ def _generate_chat_response(
 
     if not text:
         raise GeminiServiceError(
-            f"Gemini returned an empty response "
+            f"Gemini returned an empty chat response "
             f"(model={model_name})."
         )
 
@@ -166,14 +250,12 @@ USER QUESTION:
 Answer the user's question using only the report context above.
 """
 
-    # Primary model
     primary_model = os.environ.get(
         "GEMINI_CHAT_MODEL"
     ) or os.environ.get(
         "GEMINI_MODEL"
-    ) or "gemini-3.8-flash"
+    ) or "gemini-3.5-flash-lite"
 
-    # Fallback model
     fallback_model = "gemini-3.8-flash"
 
     models_to_try = [primary_model]
@@ -185,7 +267,6 @@ Answer the user's question using only the report context above.
 
     for model_name in models_to_try:
 
-        # Retry the same model 3 times
         for attempt in range(1, 4):
 
             try:
@@ -198,8 +279,11 @@ Answer the user's question using only the report context above.
             except Exception as e:
                 last_error = e
 
-                if attempt < 3:
+                if _is_retryable_error(e) and attempt < 3:
                     time.sleep(2 * attempt)
+                    continue
+
+                break
 
     raise GeminiServiceError(
         "Gemini chat failed. "
