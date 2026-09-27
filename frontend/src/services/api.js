@@ -6,7 +6,6 @@ const api = axios.create({
   baseURL: API_BASE_URL,
 });
 
-// Har request ke saath access token automatically bhejo
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('access_token');
   if (token) {
@@ -15,7 +14,6 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// Agar access token expire ho jaye (401 error), to refresh token se naya access token lo
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
