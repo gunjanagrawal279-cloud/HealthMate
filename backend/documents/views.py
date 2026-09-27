@@ -15,6 +15,7 @@ from .pdf_utils import extract_text_from_pdf, PDFExtractionError
 
 from ai.gemini_service import (
     analyze_document_text,
+    analyze_document_pdf,
     GeminiServiceError,
     ask_about_report,
 )
@@ -95,25 +96,120 @@ class DocumentAnalyzeView(APIView):
         document.analysis_status = 'PROCESSING'
         document.save()
 
-        # Step 1: extract text from the PDF
+        # =========================================================
+        # STEP 1:
+        # Try normal text extraction first.
+        #
+        # This keeps the existing text-PDF flow working.
+        # =========================================================
+
         try:
             text = extract_text_from_pdf(
                 document.file.path
             )
 
-        except PDFExtractionError as e:
+        except PDFExtractionError:
+            # =====================================================
+            # SCANNED / IMAGE-ONLY PDF FALLBACK
+            #
+            # If the PDF contains no embedded readable text,
+            # send the original PDF directly to Gemini.
+            # Gemini can inspect the visual PDF pages.
+            # =====================================================
+
+            try:
+                ai_result = analyze_document_pdf(
+                    document.file.path
+                )
+
+            except GeminiServiceError as e:
+                document.analysis_status = 'FAILED'
+                document.save()
+
+                return Response(
+                    {
+                        "detail": (
+                            "This PDF appears to be a scanned/image PDF, "
+                            "and direct AI reading also failed: "
+                            f"{e}"
+                        )
+                    },
+                    status=http_status.HTTP_400_BAD_REQUEST
+                )
+
+            # We successfully analyzed the PDF directly.
+            #
+            # There may be no extracted text, so store a clear note
+            # instead of pretending text extraction succeeded.
+            document.extracted_text = (
+                "[Scanned/image PDF analyzed directly by Gemini.]"
+            )
+
+            document.save()
+
+            # Skip analyze_document_text() because Gemini has
+            # already analyzed the PDF itself.
+            return self._save_analysis_result(
+                document,
+                ai_result
+            )
+
+        except Exception as e:
             document.analysis_status = 'FAILED'
             document.save()
 
             return Response(
-                {"detail": str(e)},
+                {
+                    "detail": (
+                        "Could not read the uploaded PDF: "
+                        f"{e}"
+                    )
+                },
                 status=http_status.HTTP_400_BAD_REQUEST
             )
 
+        # =========================================================
+        # STEP 2:
+        # We have readable text -> existing Gemini text analysis.
+        # =========================================================
+
+        if not text or not text.strip():
+
+            try:
+                ai_result = analyze_document_pdf(
+                    document.file.path
+                )
+
+            except GeminiServiceError as e:
+                document.analysis_status = 'FAILED'
+                document.save()
+
+                return Response(
+                    {
+                        "detail": (
+                            "No readable text was found in this PDF, "
+                            "and direct scanned-PDF analysis failed: "
+                            f"{e}"
+                        )
+                    },
+                    status=http_status.HTTP_400_BAD_REQUEST
+                )
+
+            document.extracted_text = (
+                "[Scanned/image PDF analyzed directly by Gemini.]"
+            )
+
+            document.save()
+
+            return self._save_analysis_result(
+                document,
+                ai_result
+            )
+
+        # Save extracted text for normal text PDFs.
         document.extracted_text = text
         document.save()
 
-        # Step 2: send text to Gemini for analysis
         try:
             ai_result = analyze_document_text(text)
 
@@ -128,7 +224,31 @@ class DocumentAnalyzeView(APIView):
                 status=http_status.HTTP_502_BAD_GATEWAY
             )
 
+        return self._save_analysis_result(
+            document,
+            ai_result
+        )
+
+    # =============================================================
+    # COMMON FUNCTION
+    #
+    # Used by both:
+    #
+    # 1. Normal text-PDF analysis
+    # 2. Scanned/image-PDF analysis
+    #
+    # =============================================================
+
+    def _save_analysis_result(
+        self,
+        document,
+        ai_result
+    ):
+
+        # ---------------------------------------------------------
         # Step 3: normalize the AI result
+        # ---------------------------------------------------------
+
         summary = ai_result.get(
             'document_summary',
             ''
@@ -154,12 +274,18 @@ class DocumentAnalyzeView(APIView):
             []
         ) or []
 
-        # Step 4: calculate status ourselves
-        # for every test result
+        # ---------------------------------------------------------
+        # Step 4:
+        # Calculate NORMAL / LOW / HIGH ourselves.
+        # ---------------------------------------------------------
+
         processed_results = []
         abnormal_names = []
 
         for item in test_results:
+
+            if not isinstance(item, dict):
+                continue
 
             ref_low = item.get(
                 'reference_low'
@@ -200,62 +326,72 @@ class DocumentAnalyzeView(APIView):
                 ref_high
             )
 
+            test_name = item.get(
+                'test_name',
+                ''
+            ) or 'Unknown Test'
+
             if calculated_status in (
                 'LOW',
                 'HIGH'
             ):
                 abnormal_names.append(
-                    item.get(
-                        'test_name',
-                        'Unknown Test'
-                    )
+                    test_name
                 )
 
-            processed_results.append({
-                'test_name': item.get(
-                    'test_name',
-                    ''
-                ) or 'Unknown Test',
+            processed_results.append(
+                {
+                    'test_name': test_name,
 
-                'value': value_str,
+                    'value': value_str,
 
-                'unit': item.get(
-                    'unit',
-                    ''
-                ) or '',
+                    'unit': item.get(
+                        'unit',
+                        ''
+                    ) or '',
 
-                'reference_range': item.get(
-                    'reference_range',
-                    ''
-                ) or '',
+                    'reference_range': item.get(
+                        'reference_range',
+                        ''
+                    ) or '',
 
-                'reference_low': ref_low,
+                    'reference_low': ref_low,
 
-                'reference_high': ref_high,
+                    'reference_high': ref_high,
 
-                'status': calculated_status,
+                    'status': calculated_status,
 
-                'explanation': item.get(
-                    'explanation',
-                    ''
-                ) or '',
-            })
+                    'explanation': item.get(
+                        'explanation',
+                        ''
+                    ) or '',
+                }
+            )
 
-        # Step 5: save or update DocumentAnalysis
-        analysis, _ = DocumentAnalysis.objects.update_or_create(
-            document=document,
-            defaults={
-                'summary': summary,
-                'key_observations': key_observations,
-                'abnormal_values': abnormal_names,
-                'simple_explanations': simple_explanations,
-                'doctor_questions': doctor_questions,
-                'raw_ai_response': ai_result,
-            }
+        # ---------------------------------------------------------
+        # Step 5:
+        # Save or update DocumentAnalysis
+        # ---------------------------------------------------------
+
+        analysis, _ = (
+            DocumentAnalysis.objects.update_or_create(
+                document=document,
+                defaults={
+                    'summary': summary,
+                    'key_observations': key_observations,
+                    'abnormal_values': abnormal_names,
+                    'simple_explanations': simple_explanations,
+                    'doctor_questions': doctor_questions,
+                    'raw_ai_response': ai_result,
+                }
+            )
         )
 
-        # Step 6: clear old test results
-        # and save the new ones
+        # ---------------------------------------------------------
+        # Step 6:
+        # Delete old test results before saving fresh results.
+        # ---------------------------------------------------------
+
         analysis.test_results.all().delete()
 
         for item in processed_results:
@@ -280,13 +416,20 @@ class DocumentAnalyzeView(APIView):
                 explanation=item['explanation'],
             )
 
+        # ---------------------------------------------------------
+        # Step 7:
+        # Mark document as successfully analyzed.
+        # ---------------------------------------------------------
+
         document.analysis_status = 'ANALYZED'
         document.save()
 
-        return Response({
-            "detail": "Document analyzed successfully.",
-            "analysis_id": analysis.id,
-        })
+        return Response(
+            {
+                "detail": "Document analyzed successfully.",
+                "analysis_id": analysis.id,
+            }
+        )
 
 
 class DocumentAnalysisDetailView(
@@ -296,6 +439,7 @@ class DocumentAnalysisDetailView(
     serializer_class = DocumentAnalysisSerializer
 
     def get_object(self):
+
         document = HealthDocument.objects.get(
             pk=self.kwargs['pk'],
             user=self.request.user
@@ -311,7 +455,12 @@ class HealthTimelineView(generics.ListAPIView):
     def get_queryset(self):
         return None
 
-    def list(self, request, *args, **kwargs):
+    def list(
+        self,
+        request,
+        *args,
+        **kwargs
+    ):
 
         documents = HealthDocument.objects.filter(
             user=request.user
@@ -345,15 +494,23 @@ class HealthTimelineView(generics.ListAPIView):
             except DocumentAnalysis.DoesNotExist:
                 pass
 
-            timeline_data.append({
-                'id': doc.id,
-                'title': doc.title,
-                'document_type': doc.document_type,
-                'uploaded_at': doc.uploaded_at,
-                'analysis_status': doc.analysis_status,
-                'total_parameters': total_parameters,
-                'outside_range_count': outside_range_count,
-            })
+            timeline_data.append(
+                {
+                    'id': doc.id,
+
+                    'title': doc.title,
+
+                    'document_type': doc.document_type,
+
+                    'uploaded_at': doc.uploaded_at,
+
+                    'analysis_status': doc.analysis_status,
+
+                    'total_parameters': total_parameters,
+
+                    'outside_range_count': outside_range_count,
+                }
+            )
 
         serializer = self.get_serializer(
             timeline_data,
@@ -379,6 +536,7 @@ class CompareReportsView(APIView):
         )
 
         if not doc1_id or not doc2_id:
+
             return Response(
                 {
                     "detail":
@@ -388,6 +546,7 @@ class CompareReportsView(APIView):
             )
 
         try:
+
             doc1 = HealthDocument.objects.get(
                 pk=doc1_id,
                 user=request.user
@@ -399,6 +558,7 @@ class CompareReportsView(APIView):
             )
 
         except HealthDocument.DoesNotExist:
+
             return Response(
                 {
                     "detail":
@@ -410,14 +570,17 @@ class CompareReportsView(APIView):
         # Always compare in chronological order
         # earlier = previous
         # later = latest
+
         if doc1.uploaded_at > doc2.uploaded_at:
             doc1, doc2 = doc2, doc1
 
         try:
+
             analysis1 = doc1.analysis
             analysis2 = doc2.analysis
 
         except DocumentAnalysis.DoesNotExist:
+
             return Response(
                 {
                     "detail":
@@ -438,7 +601,8 @@ class CompareReportsView(APIView):
 
         common_test_names = (
             set(results1.keys())
-            & set(results2.keys())
+            &
+            set(results2.keys())
         )
 
         comparisons = []
@@ -450,6 +614,7 @@ class CompareReportsView(APIView):
 
             # Only compare when units match
             # or both are blank
+
             if (
                 (r1.unit or '').strip().lower()
                 !=
@@ -458,6 +623,7 @@ class CompareReportsView(APIView):
                 continue
 
             try:
+
                 v1 = float(r1.value)
                 v2 = float(r2.value)
 
@@ -472,48 +638,53 @@ class CompareReportsView(APIView):
             percentage_change = None
 
             if v1 != 0:
+
                 percentage_change = round(
                     (v2 - v1) / v1 * 100,
                     1
                 )
 
-            comparisons.append({
-                'test_name': r1.test_name,
+            comparisons.append(
+                {
+                    'test_name': r1.test_name,
 
-                'unit': r1.unit,
+                    'unit': r1.unit,
 
-                'previous_value': v1,
+                    'previous_value': v1,
 
-                'latest_value': v2,
+                    'latest_value': v2,
 
-                'absolute_change': absolute_change,
+                    'absolute_change': absolute_change,
 
-                'percentage_change': percentage_change,
+                    'percentage_change': percentage_change,
 
-                'previous_status': r1.status,
+                    'previous_status': r1.status,
 
-                'latest_status': r2.status,
-            })
+                    'latest_status': r2.status,
+                }
+            )
 
         comparisons.sort(
             key=lambda c: c['test_name']
         )
 
-        return Response({
-            'previous_report': {
-                'id': doc1.id,
-                'title': doc1.title,
-                'uploaded_at': doc1.uploaded_at,
-            },
+        return Response(
+            {
+                'previous_report': {
+                    'id': doc1.id,
+                    'title': doc1.title,
+                    'uploaded_at': doc1.uploaded_at,
+                },
 
-            'latest_report': {
-                'id': doc2.id,
-                'title': doc2.title,
-                'uploaded_at': doc2.uploaded_at,
-            },
+                'latest_report': {
+                    'id': doc2.id,
+                    'title': doc2.title,
+                    'uploaded_at': doc2.uploaded_at,
+                },
 
-            'comparisons': comparisons,
-        })
+                'comparisons': comparisons,
+            }
+        )
 
 
 class ReportChatView(APIView):
@@ -527,6 +698,7 @@ class ReportChatView(APIView):
         ).strip()
 
         if not question:
+
             return Response(
                 {
                     "detail":
@@ -536,6 +708,7 @@ class ReportChatView(APIView):
             )
 
         try:
+
             document = HealthDocument.objects.get(
                 pk=pk,
                 user=request.user
@@ -547,6 +720,7 @@ class ReportChatView(APIView):
             HealthDocument.DoesNotExist,
             DocumentAnalysis.DoesNotExist
         ):
+
             return Response(
                 {
                     "detail":
@@ -574,12 +748,14 @@ class ReportChatView(APIView):
         }
 
         try:
+
             answer = ask_about_report(
                 context,
                 question
             )
 
         except Exception as e:
+
             return Response(
                 {
                     "detail":
@@ -588,6 +764,8 @@ class ReportChatView(APIView):
                 status=http_status.HTTP_502_BAD_GATEWAY
             )
 
-        return Response({
-            "answer": answer
-        })
+        return Response(
+            {
+                "answer": answer
+            }
+        )

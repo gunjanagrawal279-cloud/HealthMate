@@ -78,9 +78,13 @@ def _is_retryable_error(error):
     )
 
 
+# ============================================================
+# TEXT PDF ANALYSIS
+# ============================================================
+
 def analyze_document_text(extracted_text):
     """
-    Analyze uploaded health document using Gemini.
+    Analyze extracted PDF text using Gemini.
 
     Always returns a Python dictionary.
     """
@@ -146,7 +150,6 @@ def analyze_document_text(extracted_text):
             except GeminiServiceError as e:
                 last_error = e
 
-                # JSON/format errors should not be retried repeatedly.
                 error_text = str(e)
 
                 if "invalid JSON" in error_text.lower():
@@ -169,6 +172,193 @@ def analyze_document_text(extracted_text):
 
     raise GeminiServiceError(
         "Gemini document analysis failed. "
+        f"Models tried: {', '.join(models_to_try)}. "
+        f"Last error: {type(last_error).__name__}: {last_error}"
+    )
+
+
+# ============================================================
+# SCANNED / IMAGE PDF ANALYSIS
+# ============================================================
+
+def analyze_document_pdf(pdf_path):
+    """
+    Analyze a PDF directly with Gemini.
+
+    This is used for scanned/image-only PDFs where normal
+    PDF text extraction returns no readable text.
+
+    Gemini receives the original PDF and can inspect the
+    visual pages, including scanned report images and tables.
+    """
+
+    if not pdf_path:
+        raise GeminiServiceError(
+            "PDF path was not provided."
+        )
+
+    if not os.path.exists(pdf_path):
+        raise GeminiServiceError(
+            f"PDF file does not exist: {pdf_path}"
+        )
+
+    client = _get_client()
+
+    primary_model = os.environ.get(
+        "GEMINI_MODEL",
+        "gemini-3.8-flash",
+    )
+
+    fallback_model = "gemini-3.5-flash-lite"
+
+    models_to_try = [primary_model]
+
+    if fallback_model not in models_to_try:
+        models_to_try.append(fallback_model)
+
+    prompt = """
+You are HealthMate AI, an assistant for understanding health reports.
+
+The attached file is a PDF health report.
+
+The PDF may be:
+1. A normal text PDF, or
+2. A scanned/image-only PDF.
+
+IMPORTANT:
+Read the actual visual content of every PDF page.
+Do NOT depend only on embedded text.
+This is especially important when the PDF is a scanned image.
+
+Extract the information that is visibly present in the report.
+
+Return ONLY valid JSON.
+Do not use markdown.
+Do not write ```json.
+
+The JSON MUST have these top-level fields:
+
+{
+  "document_summary": "",
+  "key_observations": [],
+  "simple_explanations": [],
+  "doctor_questions": [],
+  "test_results": []
+}
+
+Every object inside "test_results" MUST contain:
+
+{
+  "test_name": "",
+  "value": "",
+  "unit": "",
+  "reference_range": "",
+  "reference_low": null,
+  "reference_high": null,
+  "explanation": ""
+}
+
+IMPORTANT RULES:
+
+1. Inspect all pages of the PDF.
+2. Read text from scanned images when necessary.
+3. Detect laboratory test names accurately.
+4. Extract the reported value accurately.
+5. Extract the unit accurately.
+6. Extract reference ranges when they are clearly visible.
+7. If a reference range is not visible, use:
+   "reference_range": "",
+   "reference_low": null,
+   "reference_high": null
+8. Do NOT invent missing values.
+9. Preserve values as shown in the report.
+10. Do NOT diagnose a disease.
+11. Do NOT claim certainty about medical conditions.
+12. Explain results in simple language.
+13. Include every clearly identifiable laboratory result.
+14. Return ONLY the JSON object.
+"""
+
+    last_error = None
+
+    for model_name in models_to_try:
+
+        for attempt in range(1, 4):
+
+            uploaded_file = None
+
+            try:
+                # Upload the original PDF to Gemini Files API.
+                uploaded_file = client.files.upload(
+                    file=pdf_path,
+                    config=types.UploadFileConfig(
+                        mime_type="application/pdf"
+                    ),
+                )
+
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        prompt,
+                        uploaded_file,
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        max_output_tokens=4096,
+                    ),
+                )
+
+                text = getattr(response, "text", None)
+
+                if not text:
+                    raise GeminiServiceError(
+                        f"Gemini returned an empty response for scanned PDF "
+                        f"(model={model_name})."
+                    )
+
+                cleaned = _clean_json_text(text)
+
+                try:
+                    parsed = json.loads(cleaned)
+
+                except json.JSONDecodeError as e:
+                    raise GeminiServiceError(
+                        "Gemini returned invalid JSON for scanned PDF analysis."
+                    ) from e
+
+                if not isinstance(parsed, dict):
+                    raise GeminiServiceError(
+                        "Gemini returned an unexpected JSON structure "
+                        "for scanned PDF analysis."
+                    )
+
+                return parsed
+
+            except GeminiServiceError as e:
+                last_error = e
+
+                error_text = str(e).lower()
+
+                if "invalid json" in error_text:
+                    break
+
+                if attempt < 3:
+                    time.sleep(2 * attempt)
+                    continue
+
+                break
+
+            except Exception as e:
+                last_error = e
+
+                if _is_retryable_error(e) and attempt < 3:
+                    time.sleep(2 * attempt)
+                    continue
+
+                break
+
+    raise GeminiServiceError(
+        "Gemini scanned PDF analysis failed. "
         f"Models tried: {', '.join(models_to_try)}. "
         f"Last error: {type(last_error).__name__}: {last_error}"
     )
