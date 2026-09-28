@@ -1,6 +1,5 @@
 import os
 import json
-import time
 
 from google import genai
 from google.genai import types
@@ -27,31 +26,24 @@ def _get_client():
     return genai.Client(api_key=_get_api_key())
 
 
-def _get_model_chain(primary_env_name, default_primary, defaults=None):
+def _get_models(env_name, default_model):
     """
-    Creates a unique list of Gemini models.
-    The first model comes from the environment variable.
-    The remaining models are used as fallbacks.
+    Primary model comes from Render environment variable.
+    Current fallback is Gemini 3.5 Flash-Lite.
     """
-    models = []
+    primary = os.environ.get(env_name) or default_model
 
-    primary = os.environ.get(primary_env_name) or default_primary
+    models = [primary]
 
-    if primary:
-        models.append(primary)
+    fallback = "gemini-3.5-flash-lite"
 
-    for model in (defaults or []):
-        if model and model not in models:
-            models.append(model)
+    if fallback not in models:
+        models.append(fallback)
 
     return models
 
 
-def _error_code(error):
-    """
-    Best-effort extraction of HTTP/API error code
-    from Gemini SDK exceptions.
-    """
+def _get_error_code(error):
     code = getattr(error, "code", None)
 
     if code is not None:
@@ -62,37 +54,14 @@ def _error_code(error):
 
     text = str(error)
 
-    for marker in ("503", "429", "500", "408", "504"):
+    for marker in ("503", "502", "500", "504", "429", "408"):
         if marker in text:
             return int(marker)
 
     return None
 
 
-def _is_retryable(error):
-    """
-    These errors are generally temporary:
-    500, 503, 504, 408
-
-    429 is NOT repeatedly retried here because it can
-    represent a quota limit. In that case we move to
-    the next configured fallback model.
-    """
-    code = _error_code(error)
-
-    return code in {
-        500,
-        503,
-        504,
-        408,
-    }
-
-
-def _clean_json_response(text):
-    """
-    Cleans Gemini markdown fences if present
-    and converts the response to a Python dictionary.
-    """
+def _clean_json(text):
     if not text:
         raise GeminiServiceError(
             "Gemini returned an empty response."
@@ -107,19 +76,19 @@ def _clean_json_response(text):
         cleaned = cleaned[3:-3].strip()
 
     try:
-        parsed = json.loads(cleaned)
+        result = json.loads(cleaned)
 
     except json.JSONDecodeError as error:
         raise GeminiServiceError(
             "Gemini returned invalid JSON for document analysis."
         ) from error
 
-    if not isinstance(parsed, dict):
+    if not isinstance(result, dict):
         raise GeminiServiceError(
-            "Gemini document analysis returned an unexpected JSON shape."
+            "Gemini returned an unexpected response format."
         )
 
-    return parsed
+    return result
 
 
 def _generate_text_analysis(
@@ -127,9 +96,6 @@ def _generate_text_analysis(
     model_name,
     extracted_text
 ):
-    """
-    Sends extracted PDF text to Gemini.
-    """
     response = client.models.generate_content(
         model=model_name,
         contents=build_user_prompt(extracted_text),
@@ -141,118 +107,79 @@ def _generate_text_analysis(
         ),
     )
 
-    text = getattr(response, "text", None)
-
-    if not text:
-        raise GeminiServiceError(
-            f"Gemini returned an empty response "
-            f"(model={model_name})."
-        )
-
-    return _clean_json_response(text)
+    return _clean_json(
+        getattr(response, "text", None)
+    )
 
 
 def analyze_document_text(extracted_text):
     """
-    Analyze a normal text-based health report.
+    Analyze a normal text-based PDF.
 
-    Model order:
-    1. GEMINI_MODEL / gemini-3.8-flash
-    2. gemini-3.5-flash-lite
-    3. gemini-3.1-flash-lite
+    We try the configured model first and then
+    Gemini 3.5 Flash-Lite as a fallback.
 
-    Temporary 5xx errors get retry with backoff.
-    Quota errors move directly to the next model.
+    No manual retry loop is used here because the
+    Gemini Python SDK already has retry behavior for
+    transient errors.
     """
 
     client = _get_client()
 
-    models_to_try = _get_model_chain(
+    models = _get_models(
         "GEMINI_MODEL",
-        "gemini-3.8-flash",
-        [
-            "gemini-3.5-flash-lite",
-            "gemini-3.1-flash-lite",
-        ],
+        "gemini-3.8-flash"
     )
-
-    if not models_to_try:
-        raise GeminiServiceError(
-            "No Gemini model is configured."
-        )
 
     last_error = None
 
-    for model_name in models_to_try:
+    for model_name in models:
 
-        for attempt in range(1, 4):
+        try:
+            print(
+                f"Starting Gemini document analysis "
+                f"with model={model_name}"
+            )
 
-            try:
-                return _generate_text_analysis(
-                    client,
-                    model_name,
-                    extracted_text,
-                )
+            return _generate_text_analysis(
+                client,
+                model_name,
+                extracted_text
+            )
 
-            except GeminiServiceError:
-                raise
+        except GeminiServiceError:
+            raise
 
-            except Exception as error:
+        except Exception as error:
 
-                last_error = error
+            last_error = error
 
-                error_code = _error_code(error)
+            print(
+                f"Gemini document analysis error | "
+                f"model={model_name} | "
+                f"code={_get_error_code(error)} | "
+                f"error={error}"
+            )
 
-                print(
-                    f"Gemini text analysis error | "
-                    f"model={model_name} | "
-                    f"attempt={attempt} | "
-                    f"code={error_code} | "
-                    f"error={error}"
-                )
-
-                # 429/quota:
-                # Don't waste retries.
-                # Move directly to fallback model.
-                if error_code == 429:
-                    break
-
-                # Other non-temporary errors:
-                # move to the next model.
-                if not _is_retryable(error):
-                    break
-
-                # Retry temporary 5xx/408 errors.
-                if attempt < 3:
-                    delay = 2 ** (attempt - 1)
-
-                    print(
-                        f"Temporary Gemini error. "
-                        f"Retrying in {delay} seconds..."
-                    )
-
-                    time.sleep(delay)
+            continue
 
     raise GeminiServiceError(
-        "Gemini document analysis failed. "
-        f"Models tried: {', '.join(models_to_try)}. "
+        "Gemini document analysis is temporarily unavailable. "
+        f"Models tried: {', '.join(models)}. "
         f"Last error: "
         f"{type(last_error).__name__}: {last_error}"
     )
 
+
+# ============================================================
+# DIRECT PDF ANALYSIS
+# ============================================================
 
 def _generate_pdf_analysis(
     client,
     model_name,
     pdf_path
 ):
-    """
-    Sends the complete PDF directly to Gemini.
-
-    This is especially useful for scanned/image-based PDFs
-    where PyMuPDF cannot extract readable text.
-    """
-
     uploaded_file = client.files.upload(
         file=pdf_path,
         config=types.UploadFileConfig(
@@ -261,19 +188,19 @@ def _generate_pdf_analysis(
     )
 
     prompt = f"""
-Analyze the attached health-report PDF for the HealthMate application.
+Analyze the attached health-report PDF.
 
 IMPORTANT:
-- Inspect every page of the PDF.
-- The PDF may be scanned or image-based.
-- Read visible text, tables, numbers, units and reference ranges.
-- Do not invent any test value.
-- Do not invent a reference range.
-- Do not diagnose a disease.
+- Inspect all pages.
+- The PDF may contain scanned/image-based pages.
+- Extract only information visible in the report.
+- Do not invent test values.
+- Do not invent reference ranges.
+- Do not diagnose diseases.
 - Do not prescribe medication.
-- Return ONLY the JSON object required by the HealthMate system prompt.
+- Return ONLY the JSON structure required by the system prompt.
 
-Use the following system rules:
+SYSTEM RULES:
 
 {SYSTEM_PROMPT}
 """
@@ -291,97 +218,60 @@ Use the following system rules:
         ),
     )
 
-    text = getattr(response, "text", None)
-
-    if not text:
-        raise GeminiServiceError(
-            f"Gemini returned an empty PDF response "
-            f"(model={model_name})."
-        )
-
-    return _clean_json_response(text)
+    return _clean_json(
+        getattr(response, "text", None)
+    )
 
 
 def analyze_document_pdf(pdf_path):
     """
-    Analyze a PDF directly with Gemini.
-
-    Used mainly when a PDF is scanned/image-based
-    and normal text extraction fails.
-
-    Temporary 503/5xx errors are retried.
-    429 quota errors move to the next model.
+    Direct PDF analysis.
+    Mainly used for scanned/image-based PDFs.
     """
 
     client = _get_client()
 
-    models_to_try = _get_model_chain(
+    models = _get_models(
         "GEMINI_MODEL",
-        "gemini-3.8-flash",
-        [
-            "gemini-3.5-flash-lite",
-            "gemini-3.1-flash-lite",
-        ],
+        "gemini-3.8-flash"
     )
-
-    if not models_to_try:
-        raise GeminiServiceError(
-            "No Gemini model is configured."
-        )
 
     last_error = None
 
-    for model_name in models_to_try:
+    for model_name in models:
 
-        for attempt in range(1, 4):
+        try:
 
-            try:
-                return _generate_pdf_analysis(
-                    client,
-                    model_name,
-                    pdf_path,
-                )
+            print(
+                f"Starting Gemini PDF analysis "
+                f"with model={model_name}"
+            )
 
-            except GeminiServiceError:
-                raise
+            return _generate_pdf_analysis(
+                client,
+                model_name,
+                pdf_path
+            )
 
-            except Exception as error:
+        except GeminiServiceError:
+            raise
 
-                last_error = error
+        except Exception as error:
 
-                error_code = _error_code(error)
+            last_error = error
 
-                print(
-                    f"Gemini PDF analysis error | "
-                    f"model={model_name} | "
-                    f"attempt={attempt} | "
-                    f"code={error_code} | "
-                    f"error={error}"
-                )
+            print(
+                f"Gemini PDF analysis error | "
+                f"model={model_name} | "
+                f"code={_get_error_code(error)} | "
+                f"error={error}"
+            )
 
-                # Quota error:
-                # immediately try fallback model.
-                if error_code == 429:
-                    break
-
-                # Other permanent/non-temporary errors.
-                if not _is_retryable(error):
-                    break
-
-                # Temporary 503 etc.
-                if attempt < 3:
-                    delay = 2 ** (attempt - 1)
-
-                    print(
-                        f"Temporary Gemini PDF error. "
-                        f"Retrying in {delay} seconds..."
-                    )
-
-                    time.sleep(delay)
+            continue
 
     raise GeminiServiceError(
-        "Gemini PDF document analysis failed. "
-        f"Models tried: {', '.join(models_to_try)}. "
+        "Gemini PDF analysis is temporarily unavailable. "
+        f"Models tried: {', '.join(models)}. "
         f"Last error: "
         f"{type(last_error).__name__}: {last_error}"
     )
@@ -399,22 +289,14 @@ Your job is to answer questions about the user's uploaded health report.
 IMPORTANT RULES:
 
 1. Use only the information provided in REPORT CONTEXT.
-
 2. Do not invent medical values.
-
 3. If the requested information is not present in the report,
-   clearly say that it is not available in the report.
-
+   say that it is not available in the report.
 4. Explain medical information in simple language.
-
 5. Do not provide a diagnosis.
-
 6. Do not claim certainty about a medical condition.
-
-7. For abnormal values, briefly explain what the value generally means,
-   while recommending consultation with a qualified healthcare professional
-   when appropriate.
-
+7. For abnormal values, explain them neutrally and recommend
+   consulting a qualified healthcare professional when appropriate.
 8. Keep answers clear and reasonably concise.
 """
 
@@ -424,10 +306,6 @@ def _generate_chat_response(
     model_name,
     prompt
 ):
-    """
-    Generate a HealthMate AI chat response.
-    """
-
     response = client.models.generate_content(
         model=model_name,
         contents=prompt,
@@ -442,8 +320,7 @@ def _generate_chat_response(
 
     if not text:
         raise GeminiServiceError(
-            f"Gemini returned an empty response "
-            f"(model={model_name})."
+            "Gemini returned an empty chat response."
         )
 
     return text.strip()
@@ -453,10 +330,6 @@ def ask_about_report(
     report_context,
     question
 ):
-    """
-    Ask Gemini a question about a previously analyzed report.
-    """
-
     if not question or not question.strip():
         raise GeminiServiceError(
             "Please provide a question."
@@ -477,78 +350,42 @@ USER QUESTION:
 
 {question.strip()}
 
-Answer the user's question using only the report context above.
+Answer using only the report context above.
 """
 
-    models_to_try = _get_model_chain(
+    models = _get_models(
         "GEMINI_CHAT_MODEL",
-        os.environ.get(
-            "GEMINI_MODEL",
-            "gemini-3.8-flash"
-        ),
-        [
-            "gemini-3.5-flash-lite",
-            "gemini-3.1-flash-lite",
-        ],
+        "gemini-3.8-flash"
     )
-
-    if not models_to_try:
-        raise GeminiServiceError(
-            "No Gemini chat model is configured."
-        )
 
     last_error = None
 
-    for model_name in models_to_try:
+    for model_name in models:
 
-        for attempt in range(1, 4):
+        try:
 
-            try:
-                return _generate_chat_response(
-                    client,
-                    model_name,
-                    prompt,
-                )
+            return _generate_chat_response(
+                client,
+                model_name,
+                prompt
+            )
 
-            except Exception as error:
+        except Exception as error:
 
-                last_error = error
+            last_error = error
 
-                error_code = _error_code(error)
+            print(
+                f"Gemini chat error | "
+                f"model={model_name} | "
+                f"code={_get_error_code(error)} | "
+                f"error={error}"
+            )
 
-                print(
-                    f"Gemini chat error | "
-                    f"model={model_name} | "
-                    f"attempt={attempt} | "
-                    f"code={error_code} | "
-                    f"error={error}"
-                )
-
-                # Quota:
-                # immediately move to fallback model.
-                if error_code == 429:
-                    break
-
-                # Permanent error:
-                # move to next model.
-                if not _is_retryable(error):
-                    break
-
-                # Temporary error:
-                # retry with exponential backoff.
-                if attempt < 3:
-                    delay = 2 ** (attempt - 1)
-
-                    print(
-                        f"Temporary Gemini chat error. "
-                        f"Retrying in {delay} seconds..."
-                    )
-
-                    time.sleep(delay)
+            continue
 
     raise GeminiServiceError(
-        "Gemini chat failed. "
-        f"Models tried: {', '.join(models_to_try)}. "
+        "Gemini chat is temporarily unavailable. "
+        f"Models tried: {', '.join(models)}. "
         f"Last error: "
         f"{type(last_error).__name__}: {last_error}"
     )
