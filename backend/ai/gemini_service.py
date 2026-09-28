@@ -27,83 +27,159 @@ def _get_client():
     return genai.Client(api_key=_get_api_key())
 
 
-def _clean_json_text(text):
+def _get_model_chain(primary_env_name, default_primary, defaults=None):
     """
-    Clean Gemini response before JSON parsing.
-    Handles normal JSON and markdown code fences.
+    Creates a unique list of Gemini models.
+    The first model comes from the environment variable.
+    The remaining models are used as fallbacks.
     """
+    models = []
 
+    primary = os.environ.get(primary_env_name) or default_primary
+
+    if primary:
+        models.append(primary)
+
+    for model in (defaults or []):
+        if model and model not in models:
+            models.append(model)
+
+    return models
+
+
+def _error_code(error):
+    """
+    Best-effort extraction of HTTP/API error code
+    from Gemini SDK exceptions.
+    """
+    code = getattr(error, "code", None)
+
+    if code is not None:
+        try:
+            return int(code)
+        except (TypeError, ValueError):
+            pass
+
+    text = str(error)
+
+    for marker in ("503", "429", "500", "408", "504"):
+        if marker in text:
+            return int(marker)
+
+    return None
+
+
+def _is_retryable(error):
+    """
+    These errors are generally temporary:
+    500, 503, 504, 408
+
+    429 is NOT repeatedly retried here because it can
+    represent a quota limit. In that case we move to
+    the next configured fallback model.
+    """
+    code = _error_code(error)
+
+    return code in {
+        500,
+        503,
+        504,
+        408,
+    }
+
+
+def _clean_json_response(text):
+    """
+    Cleans Gemini markdown fences if present
+    and converts the response to a Python dictionary.
+    """
     if not text:
-        return ""
+        raise GeminiServiceError(
+            "Gemini returned an empty response."
+        )
 
     cleaned = text.strip()
 
-    if cleaned.startswith("```json"):
-        cleaned = cleaned[7:]
+    if cleaned.startswith("```json") and cleaned.endswith("```"):
+        cleaned = cleaned[7:-3].strip()
 
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
+    elif cleaned.startswith("```") and cleaned.endswith("```"):
+        cleaned = cleaned[3:-3].strip()
 
-    elif cleaned.startswith("```"):
-        cleaned = cleaned[3:]
+    try:
+        parsed = json.loads(cleaned)
 
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
+    except json.JSONDecodeError as error:
+        raise GeminiServiceError(
+            "Gemini returned invalid JSON for document analysis."
+        ) from error
 
-    return cleaned.strip()
+    if not isinstance(parsed, dict):
+        raise GeminiServiceError(
+            "Gemini document analysis returned an unexpected JSON shape."
+        )
+
+    return parsed
 
 
-def _is_retryable_error(error):
+def _generate_text_analysis(
+    client,
+    model_name,
+    extracted_text
+):
     """
-    Return True for temporary Gemini/API errors.
+    Sends extracted PDF text to Gemini.
     """
-
-    error_text = str(error).upper()
-
-    retryable_keywords = [
-        "503",
-        "UNAVAILABLE",
-        "429",
-        "RESOURCE_EXHAUSTED",
-        "500",
-        "502",
-        "504",
-        "INTERNAL",
-        "TIMEOUT",
-    ]
-
-    return any(
-        keyword in error_text
-        for keyword in retryable_keywords
+    response = client.models.generate_content(
+        model=model_name,
+        contents=build_user_prompt(extracted_text),
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            temperature=0.2,
+            max_output_tokens=4096,
+        ),
     )
 
+    text = getattr(response, "text", None)
 
-# ============================================================
-# TEXT PDF ANALYSIS
-# ============================================================
+    if not text:
+        raise GeminiServiceError(
+            f"Gemini returned an empty response "
+            f"(model={model_name})."
+        )
+
+    return _clean_json_response(text)
+
 
 def analyze_document_text(extracted_text):
     """
-    Analyze extracted PDF text using Gemini.
+    Analyze a normal text-based health report.
 
-    Always returns a Python dictionary.
+    Model order:
+    1. GEMINI_MODEL / gemini-3.8-flash
+    2. gemini-3.5-flash-lite
+    3. gemini-3.1-flash-lite
+
+    Temporary 5xx errors get retry with backoff.
+    Quota errors move directly to the next model.
     """
 
     client = _get_client()
 
-    primary_model = os.environ.get(
+    models_to_try = _get_model_chain(
         "GEMINI_MODEL",
-        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
+        [
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+        ],
     )
 
-    fallback_model = "gemini-3.8-flash"
-
-    models_to_try = [primary_model]
-
-    if fallback_model not in models_to_try:
-        models_to_try.append(fallback_model)
-
-    prompt = build_user_prompt(extracted_text)
+    if not models_to_try:
+        raise GeminiServiceError(
+            "No Gemini model is configured."
+        )
 
     last_error = None
 
@@ -112,172 +188,146 @@ def analyze_document_text(extracted_text):
         for attempt in range(1, 4):
 
             try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        response_mime_type="application/json",
-                        max_output_tokens=4096,
-                    ),
+                return _generate_text_analysis(
+                    client,
+                    model_name,
+                    extracted_text,
                 )
 
-                text = getattr(response, "text", None)
+            except GeminiServiceError:
+                raise
 
-                if not text:
-                    raise GeminiServiceError(
-                        f"Gemini returned an empty response "
-                        f"(model={model_name})."
-                    )
+            except Exception as error:
 
-                cleaned = _clean_json_text(text)
+                last_error = error
 
-                try:
-                    parsed = json.loads(cleaned)
+                error_code = _error_code(error)
 
-                except json.JSONDecodeError as e:
-                    raise GeminiServiceError(
-                        "Gemini returned invalid JSON for document analysis."
-                    ) from e
+                print(
+                    f"Gemini text analysis error | "
+                    f"model={model_name} | "
+                    f"attempt={attempt} | "
+                    f"code={error_code} | "
+                    f"error={error}"
+                )
 
-                if not isinstance(parsed, dict):
-                    raise GeminiServiceError(
-                        "Gemini returned an unexpected JSON structure."
-                    )
-
-                return parsed
-
-            except GeminiServiceError as e:
-                last_error = e
-
-                error_text = str(e)
-
-                if "invalid JSON" in error_text.lower():
+                # 429/quota:
+                # Don't waste retries.
+                # Move directly to fallback model.
+                if error_code == 429:
                     break
 
+                # Other non-temporary errors:
+                # move to the next model.
+                if not _is_retryable(error):
+                    break
+
+                # Retry temporary 5xx/408 errors.
                 if attempt < 3:
-                    time.sleep(2 * attempt)
-                    continue
+                    delay = 2 ** (attempt - 1)
 
-                break
+                    print(
+                        f"Temporary Gemini error. "
+                        f"Retrying in {delay} seconds..."
+                    )
 
-            except Exception as e:
-                last_error = e
-
-                if _is_retryable_error(e) and attempt < 3:
-                    time.sleep(2 * attempt)
-                    continue
-
-                break
+                    time.sleep(delay)
 
     raise GeminiServiceError(
         "Gemini document analysis failed. "
         f"Models tried: {', '.join(models_to_try)}. "
-        f"Last error: {type(last_error).__name__}: {last_error}"
+        f"Last error: "
+        f"{type(last_error).__name__}: {last_error}"
     )
 
 
-# ============================================================
-# SCANNED / IMAGE PDF ANALYSIS
-# ============================================================
+def _generate_pdf_analysis(
+    client,
+    model_name,
+    pdf_path
+):
+    """
+    Sends the complete PDF directly to Gemini.
+
+    This is especially useful for scanned/image-based PDFs
+    where PyMuPDF cannot extract readable text.
+    """
+
+    uploaded_file = client.files.upload(
+        file=pdf_path,
+        config=types.UploadFileConfig(
+            mime_type="application/pdf"
+        ),
+    )
+
+    prompt = f"""
+Analyze the attached health-report PDF for the HealthMate application.
+
+IMPORTANT:
+- Inspect every page of the PDF.
+- The PDF may be scanned or image-based.
+- Read visible text, tables, numbers, units and reference ranges.
+- Do not invent any test value.
+- Do not invent a reference range.
+- Do not diagnose a disease.
+- Do not prescribe medication.
+- Return ONLY the JSON object required by the HealthMate system prompt.
+
+Use the following system rules:
+
+{SYSTEM_PROMPT}
+"""
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=[
+            prompt,
+            uploaded_file,
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.2,
+            max_output_tokens=4096,
+        ),
+    )
+
+    text = getattr(response, "text", None)
+
+    if not text:
+        raise GeminiServiceError(
+            f"Gemini returned an empty PDF response "
+            f"(model={model_name})."
+        )
+
+    return _clean_json_response(text)
+
 
 def analyze_document_pdf(pdf_path):
     """
     Analyze a PDF directly with Gemini.
 
-    This is used for scanned/image-only PDFs where normal
-    PDF text extraction returns no readable text.
+    Used mainly when a PDF is scanned/image-based
+    and normal text extraction fails.
 
-    Gemini receives the original PDF and can inspect the
-    visual pages, including scanned report images and tables.
+    Temporary 503/5xx errors are retried.
+    429 quota errors move to the next model.
     """
-
-    if not pdf_path:
-        raise GeminiServiceError(
-            "PDF path was not provided."
-        )
-
-    if not os.path.exists(pdf_path):
-        raise GeminiServiceError(
-            f"PDF file does not exist: {pdf_path}"
-        )
 
     client = _get_client()
 
-    primary_model = os.environ.get(
+    models_to_try = _get_model_chain(
         "GEMINI_MODEL",
         "gemini-3.8-flash",
+        [
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+        ],
     )
 
-    fallback_model = "gemini-3.5-flash-lite"
-
-    models_to_try = [primary_model]
-
-    if fallback_model not in models_to_try:
-        models_to_try.append(fallback_model)
-
-    prompt = """
-You are HealthMate AI, an assistant for understanding health reports.
-
-The attached file is a PDF health report.
-
-The PDF may be:
-1. A normal text PDF, or
-2. A scanned/image-only PDF.
-
-IMPORTANT:
-Read the actual visual content of every PDF page.
-Do NOT depend only on embedded text.
-This is especially important when the PDF is a scanned image.
-
-Extract the information that is visibly present in the report.
-
-Return ONLY valid JSON.
-Do not use markdown.
-Do not write ```json.
-
-The JSON MUST have these top-level fields:
-
-{
-  "document_summary": "",
-  "key_observations": [],
-  "simple_explanations": [],
-  "doctor_questions": [],
-  "test_results": []
-}
-
-Every object inside "test_results" MUST contain:
-
-{
-  "test_name": "",
-  "value": "",
-  "unit": "",
-  "reference_range": "",
-  "reference_low": null,
-  "reference_high": null,
-  "explanation": ""
-}
-
-IMPORTANT RULES:
-
-1. Inspect all pages of the PDF.
-2. Read text from scanned images when necessary.
-3. Detect laboratory test names accurately.
-4. Extract the reported value accurately.
-5. Extract the unit accurately.
-6. Extract reference ranges when they are clearly visible.
-7. If a reference range is not visible, use:
-   "reference_range": "",
-   "reference_low": null,
-   "reference_high": null
-8. Do NOT invent missing values.
-9. Preserve values as shown in the report.
-10. Do NOT diagnose a disease.
-11. Do NOT claim certainty about medical conditions.
-12. Explain results in simple language.
-13. Include every clearly identifiable laboratory result.
-14. Return ONLY the JSON object.
-"""
+    if not models_to_try:
+        raise GeminiServiceError(
+            "No Gemini model is configured."
+        )
 
     last_error = None
 
@@ -285,87 +335,60 @@ IMPORTANT RULES:
 
         for attempt in range(1, 4):
 
-            uploaded_file = None
-
             try:
-                # Upload the original PDF to Gemini Files API.
-                uploaded_file = client.files.upload(
-                    file=pdf_path,
-                    config=types.UploadFileConfig(
-                        mime_type="application/pdf"
-                    ),
+                return _generate_pdf_analysis(
+                    client,
+                    model_name,
+                    pdf_path,
                 )
 
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=[
-                        prompt,
-                        uploaded_file,
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        max_output_tokens=4096,
-                    ),
+            except GeminiServiceError:
+                raise
+
+            except Exception as error:
+
+                last_error = error
+
+                error_code = _error_code(error)
+
+                print(
+                    f"Gemini PDF analysis error | "
+                    f"model={model_name} | "
+                    f"attempt={attempt} | "
+                    f"code={error_code} | "
+                    f"error={error}"
                 )
 
-                text = getattr(response, "text", None)
-
-                if not text:
-                    raise GeminiServiceError(
-                        f"Gemini returned an empty response for scanned PDF "
-                        f"(model={model_name})."
-                    )
-
-                cleaned = _clean_json_text(text)
-
-                try:
-                    parsed = json.loads(cleaned)
-
-                except json.JSONDecodeError as e:
-                    raise GeminiServiceError(
-                        "Gemini returned invalid JSON for scanned PDF analysis."
-                    ) from e
-
-                if not isinstance(parsed, dict):
-                    raise GeminiServiceError(
-                        "Gemini returned an unexpected JSON structure "
-                        "for scanned PDF analysis."
-                    )
-
-                return parsed
-
-            except GeminiServiceError as e:
-                last_error = e
-
-                error_text = str(e).lower()
-
-                if "invalid json" in error_text:
+                # Quota error:
+                # immediately try fallback model.
+                if error_code == 429:
                     break
 
+                # Other permanent/non-temporary errors.
+                if not _is_retryable(error):
+                    break
+
+                # Temporary 503 etc.
                 if attempt < 3:
-                    time.sleep(2 * attempt)
-                    continue
+                    delay = 2 ** (attempt - 1)
 
-                break
+                    print(
+                        f"Temporary Gemini PDF error. "
+                        f"Retrying in {delay} seconds..."
+                    )
 
-            except Exception as e:
-                last_error = e
-
-                if _is_retryable_error(e) and attempt < 3:
-                    time.sleep(2 * attempt)
-                    continue
-
-                break
+                    time.sleep(delay)
 
     raise GeminiServiceError(
-        "Gemini scanned PDF analysis failed. "
+        "Gemini PDF document analysis failed. "
         f"Models tried: {', '.join(models_to_try)}. "
-        f"Last error: {type(last_error).__name__}: {last_error}"
+        f"Last error: "
+        f"{type(last_error).__name__}: {last_error}"
     )
 
 
 # ============================================================
-# CHAT / ASK HEALTHMATE
+# HEALTHMATE AI CHAT
 # ============================================================
 
 CHAT_SYSTEM_PROMPT = """
@@ -376,15 +399,22 @@ Your job is to answer questions about the user's uploaded health report.
 IMPORTANT RULES:
 
 1. Use only the information provided in REPORT CONTEXT.
+
 2. Do not invent medical values.
+
 3. If the requested information is not present in the report,
    clearly say that it is not available in the report.
+
 4. Explain medical information in simple language.
+
 5. Do not provide a diagnosis.
+
 6. Do not claim certainty about a medical condition.
+
 7. For abnormal values, briefly explain what the value generally means,
    while recommending consultation with a qualified healthcare professional
    when appropriate.
+
 8. Keep answers clear and reasonably concise.
 """
 
@@ -392,10 +422,10 @@ IMPORTANT RULES:
 def _generate_chat_response(
     client,
     model_name,
-    prompt,
+    prompt
 ):
     """
-    Send one chat request to Gemini.
+    Generate a HealthMate AI chat response.
     """
 
     response = client.models.generate_content(
@@ -403,7 +433,8 @@ def _generate_chat_response(
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=CHAT_SYSTEM_PROMPT,
-            max_output_tokens=1024,
+            temperature=0.2,
+            max_output_tokens=512,
         ),
     )
 
@@ -411,14 +442,17 @@ def _generate_chat_response(
 
     if not text:
         raise GeminiServiceError(
-            f"Gemini returned an empty chat response "
+            f"Gemini returned an empty response "
             f"(model={model_name})."
         )
 
     return text.strip()
 
 
-def ask_about_report(report_context, question):
+def ask_about_report(
+    report_context,
+    question
+):
     """
     Ask Gemini a question about a previously analyzed report.
     """
@@ -432,26 +466,36 @@ def ask_about_report(report_context, question):
 
     prompt = f"""
 REPORT CONTEXT:
-{json.dumps(report_context, indent=2, default=str)}
+
+{json.dumps(
+    report_context,
+    indent=2,
+    default=str
+)}
 
 USER QUESTION:
+
 {question.strip()}
 
 Answer the user's question using only the report context above.
 """
 
-    primary_model = os.environ.get(
-        "GEMINI_CHAT_MODEL"
-    ) or os.environ.get(
-        "GEMINI_MODEL"
-    ) or "gemini-3.5-flash-lite"
+    models_to_try = _get_model_chain(
+        "GEMINI_CHAT_MODEL",
+        os.environ.get(
+            "GEMINI_MODEL",
+            "gemini-3.8-flash"
+        ),
+        [
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+        ],
+    )
 
-    fallback_model = "gemini-3.8-flash"
-
-    models_to_try = [primary_model]
-
-    if fallback_model not in models_to_try:
-        models_to_try.append(fallback_model)
+    if not models_to_try:
+        raise GeminiServiceError(
+            "No Gemini chat model is configured."
+        )
 
     last_error = None
 
@@ -466,17 +510,45 @@ Answer the user's question using only the report context above.
                     prompt,
                 )
 
-            except Exception as e:
-                last_error = e
+            except Exception as error:
 
-                if _is_retryable_error(e) and attempt < 3:
-                    time.sleep(2 * attempt)
-                    continue
+                last_error = error
 
-                break
+                error_code = _error_code(error)
+
+                print(
+                    f"Gemini chat error | "
+                    f"model={model_name} | "
+                    f"attempt={attempt} | "
+                    f"code={error_code} | "
+                    f"error={error}"
+                )
+
+                # Quota:
+                # immediately move to fallback model.
+                if error_code == 429:
+                    break
+
+                # Permanent error:
+                # move to next model.
+                if not _is_retryable(error):
+                    break
+
+                # Temporary error:
+                # retry with exponential backoff.
+                if attempt < 3:
+                    delay = 2 ** (attempt - 1)
+
+                    print(
+                        f"Temporary Gemini chat error. "
+                        f"Retrying in {delay} seconds..."
+                    )
+
+                    time.sleep(delay)
 
     raise GeminiServiceError(
         "Gemini chat failed. "
         f"Models tried: {', '.join(models_to_try)}. "
-        f"Last error: {type(last_error).__name__}: {last_error}"
+        f"Last error: "
+        f"{type(last_error).__name__}: {last_error}"
     )
