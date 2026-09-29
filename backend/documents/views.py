@@ -1,4 +1,5 @@
 import re
+from django.db import transaction
 
 from rest_framework import generics, permissions, status as http_status
 from rest_framework.views import APIView
@@ -244,24 +245,94 @@ def _build_local_fallback_analysis(text):
     }
 
 
+def _safe_string(value, max_length):
+    """Convert a value to a bounded string for CharField safety."""
+    if value is None:
+        return ''
+    return str(value).strip()[:max_length]
+
+
+def _safe_string_list(value, item_limit=30, item_length=500):
+    """Keep JSON-list content simple, bounded and serializable."""
+    if not isinstance(value, list):
+        return []
+
+    cleaned = []
+
+    for item in value[:item_limit]:
+        if isinstance(item, (str, int, float, bool)):
+            cleaned.append(str(item)[:item_length])
+
+    return cleaned
+
+
 def _normalize_and_save_analysis(document, ai_result):
-    summary = ai_result.get('document_summary', '') or ''
-    key_observations = ai_result.get('key_observations', []) or []
-    simple_explanations = ai_result.get('simple_explanations', []) or []
-    doctor_questions = ai_result.get('doctor_questions', []) or []
+    """
+    Normalize Gemini/local-fallback output and save it safely.
+
+    Database-facing strings are bounded to the actual model field sizes.
+    """
+
+    summary = _safe_string(
+        ai_result.get('document_summary', ''),
+        30000,
+    )
+
+    key_observations = _safe_string_list(
+        ai_result.get('key_observations', []),
+        item_limit=30,
+        item_length=1000,
+    )
+
+    simple_explanations = _safe_string_list(
+        ai_result.get('simple_explanations', []),
+        item_limit=30,
+        item_length=1000,
+    )
+
+    doctor_questions = _safe_string_list(
+        ai_result.get('doctor_questions', []),
+        item_limit=30,
+        item_length=1000,
+    )
+
     test_results = ai_result.get('test_results', []) or []
 
     processed_results = []
     abnormal_names = []
 
-    for item in test_results:
+    for item in test_results[:100]:
+
         if not isinstance(item, dict):
             continue
 
         ref_low = _parse_number(item.get('reference_low'))
         ref_high = _parse_number(item.get('reference_high'))
-        value_str = item.get('value', '') or ''
-        test_name = item.get('test_name', '') or 'Unknown Test'
+
+        value_str = _safe_string(
+            item.get('value', ''),
+            50,
+        )
+
+        test_name = _safe_string(
+            item.get('test_name', ''),
+            150,
+        ) or 'Unknown Test'
+
+        unit = _safe_string(
+            item.get('unit', ''),
+            30,
+        )
+
+        reference_range = _safe_string(
+            item.get('reference_range', ''),
+            100,
+        )
+
+        explanation = _safe_string(
+            item.get('explanation', ''),
+            5000,
+        )
 
         calculated_status = calculate_status(
             value_str,
@@ -275,43 +346,109 @@ def _normalize_and_save_analysis(document, ai_result):
         processed_results.append({
             'test_name': test_name,
             'value': value_str,
-            'unit': item.get('unit', '') or '',
-            'reference_range': item.get('reference_range', '') or '',
+            'unit': unit,
+            'reference_range': reference_range,
             'reference_low': ref_low,
             'reference_high': ref_high,
             'status': calculated_status,
-            'explanation': item.get('explanation', '') or '',
+            'explanation': explanation,
         })
 
-    analysis, _ = DocumentAnalysis.objects.update_or_create(
-        document=document,
-        defaults={
-            'summary': summary,
-            'key_observations': key_observations,
-            'abnormal_values': abnormal_names,
-            'simple_explanations': simple_explanations,
-            'doctor_questions': doctor_questions,
-            'raw_ai_response': ai_result,
-        },
-    )
+    safe_raw_response = {
+        'document_summary': summary,
+        'key_observations': key_observations,
+        'simple_explanations': simple_explanations,
+        'doctor_questions': doctor_questions,
+        'test_results': processed_results,
+    }
 
-    analysis.test_results.all().delete()
+    with transaction.atomic():
 
-    for item in processed_results:
-        ExtractedTestResult.objects.create(
-            analysis=analysis,
-            test_name=item['test_name'],
-            value=item['value'],
-            unit=item['unit'],
-            reference_range=item['reference_range'],
-            reference_low=item['reference_low'],
-            reference_high=item['reference_high'],
-            status=item['status'],
-            explanation=item['explanation'],
+        analysis, _ = DocumentAnalysis.objects.update_or_create(
+            document=document,
+            defaults={
+                'summary': summary,
+                'key_observations': key_observations,
+                'abnormal_values': _safe_string_list(
+                    abnormal_names,
+                    item_limit=100,
+                    item_length=150,
+                ),
+                'simple_explanations': simple_explanations,
+                'doctor_questions': doctor_questions,
+                'raw_ai_response': safe_raw_response,
+            },
         )
 
-    document.analysis_status = 'ANALYZED'
-    document.save(update_fields=['analysis_status'])
+        analysis.test_results.all().delete()
+
+        for item in processed_results:
+            ExtractedTestResult.objects.create(
+                analysis=analysis,
+                test_name=item['test_name'],
+                value=item['value'],
+                unit=item['unit'],
+                reference_range=item['reference_range'],
+                reference_low=item['reference_low'],
+                reference_high=item['reference_high'],
+                status=item['status'],
+                explanation=item['explanation'],
+            )
+
+        document.analysis_status = 'ANALYZED'
+        document.save(update_fields=['analysis_status'])
+
+    return analysis
+
+
+def _save_minimal_fallback_analysis(document, original_text):
+    """
+    Last-resort fallback that does not depend on Gemini and does not
+    create individual test rows. It keeps the report in ANALYZED state
+    so the user can still open the analysis page.
+    """
+
+    summary = (
+        'Gemini AI is temporarily unavailable. HealthMate successfully '
+        'read the uploaded PDF, but the AI interpretation service could '
+        'not be reached at this moment. Please use the original report '
+        'and a qualified healthcare professional for medical interpretation.'
+    )
+
+    observations = [
+        'The PDF was uploaded and its readable text was extracted successfully.'
+    ]
+
+    if original_text and original_text.strip():
+        observations.append(
+            f'Extracted report text length: {len(original_text)} characters.'
+        )
+
+    with transaction.atomic():
+
+        analysis, _ = DocumentAnalysis.objects.update_or_create(
+            document=document,
+            defaults={
+                'summary': summary,
+                'key_observations': observations,
+                'abnormal_values': [],
+                'simple_explanations': [
+                    'AI interpretation is temporarily unavailable.'
+                ],
+                'doctor_questions': [
+                    'Please discuss the report with a qualified healthcare professional.'
+                ],
+                'raw_ai_response': {
+                    'source': 'local_fallback',
+                    'ai_unavailable': True,
+                },
+            },
+        )
+
+        analysis.test_results.all().delete()
+
+        document.analysis_status = 'ANALYZED'
+        document.save(update_fields=['analysis_status'])
 
     return analysis
 
@@ -397,8 +534,7 @@ class DocumentAnalyzeView(APIView):
         document.extracted_text = text
         document.save(update_fields=['extracted_text'])
 
-        # 4. Try Gemini. If Gemini is temporarily unavailable, use the
-        #    local readable-PDF fallback rather than marking the report failed.
+        # 4. Try Gemini first.
         try:
             ai_result = analyze_document_text(text)
             used_fallback = False
@@ -417,24 +553,44 @@ class DocumentAnalyzeView(APIView):
             ai_result = _build_local_fallback_analysis(text)
             used_fallback = True
 
-        # 5. Save the result.
+        # 5. Save the result. If the detailed local fallback contains data
+        # that cannot fit the database schema, save one minimal safe analysis
+        # instead of returning HTTP 500.
         try:
             analysis = _normalize_and_save_analysis(
                 document,
                 ai_result,
             )
-        except Exception as error:
-            document.analysis_status = 'FAILED'
-            document.save(update_fields=['analysis_status'])
 
-            return Response(
-                {
-                    'detail': (
-                        f'Could not save report analysis: {error}'
-                    )
-                },
-                status=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+        except Exception as error:
+            print(
+                f'Fallback/analysis save error: {error}'
             )
+
+            try:
+                analysis = _save_minimal_fallback_analysis(
+                    document,
+                    text,
+                )
+                used_fallback = True
+
+            except Exception as final_error:
+                print(
+                    f'Minimal fallback save also failed: {final_error}'
+                )
+
+                document.analysis_status = 'FAILED'
+                document.save(update_fields=['analysis_status'])
+
+                return Response(
+                    {
+                        'detail': (
+                            'Report could not be processed because the temporary '
+                            'AI service is unavailable and the report could not be saved.'
+                        )
+                    },
+                    status=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
 
         return Response({
             'detail': (
@@ -442,7 +598,7 @@ class DocumentAnalyzeView(APIView):
                 if not used_fallback
                 else
                 'Report processed successfully. Gemini was temporarily '
-                'unavailable, so readable report values were extracted locally.'
+                'unavailable, so HealthMate used its local report fallback.'
             ),
             'analysis_id': analysis.id,
             'used_fallback': used_fallback,
