@@ -1,3 +1,4 @@
+
 from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
@@ -8,8 +9,12 @@ urlpatterns = [
     path('api/auth/', include('accounts.urls')),
     path('api/profile/', include('profiles.urls')),
     path('api/documents/', include('documents.urls')),
-       path('api/dashboard/', include('dashboard.urls')), 
+    path('api/dashboard/', include('dashboard.urls')),
+    path('api/doctors/', include('doctors.urls')),
 ]
 
 if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+    urlpatterns += static(
+        settings.MEDIA_URL,
+        document_root=settings.MEDIA_ROOT
+    )

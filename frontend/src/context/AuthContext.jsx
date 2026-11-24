@@ -1,16 +1,80 @@
-import { createContext, useContext, useEffect, useState } from 'react';
+
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  useCallback
+} from 'react';
+
 import api from '../services/api';
 
 const AuthContext = createContext(null);
+
+// Backend errors ko readable message mein convert karo
+const getErrorMessage = (error, fallback) => {
+  const status = error.response?.status;
+  const data = error.response?.data;
+
+  if (data) {
+    if (typeof data === 'string') {
+      return data;
+    }
+
+    if (data.detail) return data.detail;
+
+    if (data.non_field_errors?.length) {
+      return data.non_field_errors[0];
+    }
+
+    const fields = [
+      'username',
+      'email',
+      'password'
+    ];
+
+    for (const field of fields) {
+      if (data[field]) {
+        return Array.isArray(data[field])
+          ? data[field][0]
+          : String(data[field]);
+      }
+    }
+
+    const firstValue = Object.values(data)[0];
+
+    if (firstValue) {
+      return Array.isArray(firstValue)
+        ? firstValue[0]
+        : String(firstValue);
+    }
+  }
+
+  if (status === 500) {
+    return 'Server error (500). Please try again later.';
+  }
+
+  if (status === 404) {
+    return 'API endpoint not found (404).';
+  }
+
+  if (status === 400) {
+    return 'Invalid information. Please check your details.';
+  }
+
+  if (!error.response) {
+    return 'Unable to connect to the server. Check your internet connection.';
+  }
+
+  return error.message || fallback;
+};
 
 export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  // --------------------------------------------------
-  // Get currently logged-in user
-  // --------------------------------------------------
-  const loadUser = async () => {
+  // Currently logged-in user load karo
+  const loadUser = useCallback(async () => {
     const accessToken = localStorage.getItem('access_token');
 
     if (!accessToken) {
@@ -25,30 +89,28 @@ export const AuthProvider = ({ children }) => {
     } catch (error) {
       console.error('Failed to load user:', error);
 
-      // Invalid/expired session
-      localStorage.removeItem('access_token');
-      localStorage.removeItem('refresh_token');
+      // Sirf unauthorized hone par tokens clear karo
+      if (error.response?.status === 401) {
+        localStorage.removeItem('access_token');
+        localStorage.removeItem('refresh_token');
+      }
+
       setUser(null);
     } finally {
       setLoading(false);
     }
-  };
-
-  // --------------------------------------------------
-  // Run once when app starts
-  // --------------------------------------------------
-  useEffect(() => {
-    loadUser();
   }, []);
 
-  // --------------------------------------------------
+  useEffect(() => {
+    loadUser();
+  }, [loadUser]);
+
   // LOGIN
-  // --------------------------------------------------
   const login = async (username, password) => {
     try {
       const response = await api.post('/auth/login/', {
         username,
-        password,
+        password
       });
 
       const accessToken = response.data.access;
@@ -60,18 +122,9 @@ export const AuthProvider = ({ children }) => {
         );
       }
 
-      // Save tokens first
-      localStorage.setItem(
-        'access_token',
-        accessToken
-      );
+      localStorage.setItem('access_token', accessToken);
+      localStorage.setItem('refresh_token', refreshToken);
 
-      localStorage.setItem(
-        'refresh_token',
-        refreshToken
-      );
-
-      // Get actual user information
       const meResponse = await api.get('/auth/me/');
 
       setUser(meResponse.data);
@@ -81,49 +134,25 @@ export const AuthProvider = ({ children }) => {
     } catch (error) {
       console.error('Login failed:', error);
 
-      // Do not keep broken tokens
       localStorage.removeItem('access_token');
       localStorage.removeItem('refresh_token');
 
-      let message = 'Login failed. Please try again.';
+      setUser(null);
 
-      if (error.response?.data) {
-        const data = error.response.data;
-
-        if (data.detail) {
-          message = data.detail;
-        } else if (data.non_field_errors?.length) {
-          message = data.non_field_errors[0];
-        } else if (data.username?.length) {
-          message = data.username[0];
-        } else if (data.password?.length) {
-          message = data.password[0];
-        }
-      } else if (error.message) {
-        message = error.message;
-      }
-
-      throw new Error(message);
+      throw new Error(
+        getErrorMessage(error, 'Login failed. Please try again.')
+      );
     }
   };
 
-  // --------------------------------------------------
   // REGISTER
-  // --------------------------------------------------
-  const register = async (
-    username,
-    email,
-    password
-  ) => {
+  const register = async (username, email, password) => {
     try {
-      const response = await api.post(
-        '/auth/register/',
-        {
-          username,
-          email,
-          password,
-        }
-      );
+      const response = await api.post('/auth/register/', {
+        username,
+        email,
+        password
+      });
 
       const accessToken = response.data.access;
       const refreshToken = response.data.refresh;
@@ -134,17 +163,9 @@ export const AuthProvider = ({ children }) => {
         );
       }
 
-      localStorage.setItem(
-        'access_token',
-        accessToken
-      );
+      localStorage.setItem('access_token', accessToken);
+      localStorage.setItem('refresh_token', refreshToken);
 
-      localStorage.setItem(
-        'refresh_token',
-        refreshToken
-      );
-
-      // Backend registration already returns user
       if (response.data.user) {
         setUser(response.data.user);
       } else {
@@ -157,36 +178,13 @@ export const AuthProvider = ({ children }) => {
     } catch (error) {
       console.error('Registration failed:', error);
 
-      localStorage.removeItem('access_token');
-      localStorage.removeItem('refresh_token');
-
-      let message = 'Registration failed. Please try again.';
-
-      if (error.response?.data) {
-        const data = error.response.data;
-
-        if (data.username?.length) {
-          message = data.username[0];
-        } else if (data.email?.length) {
-          message = data.email[0];
-        } else if (data.password?.length) {
-          message = data.password[0];
-        } else if (data.detail) {
-          message = data.detail;
-        } else if (data.non_field_errors?.length) {
-          message = data.non_field_errors[0];
-        }
-      } else if (error.message) {
-        message = error.message;
-      }
-
-      throw new Error(message);
+      throw new Error(
+        getErrorMessage(error, 'Registration failed. Please try again.')
+      );
     }
   };
 
-  // --------------------------------------------------
   // LOGOUT
-  // --------------------------------------------------
   const logout = () => {
     localStorage.removeItem('access_token');
     localStorage.removeItem('refresh_token');
@@ -194,9 +192,6 @@ export const AuthProvider = ({ children }) => {
     setUser(null);
   };
 
-  // --------------------------------------------------
-  // AUTH STATUS
-  // --------------------------------------------------
   const isAuthenticated = !!user;
 
   return (
@@ -208,7 +203,7 @@ export const AuthProvider = ({ children }) => {
         login,
         register,
         logout,
-        loadUser,
+        loadUser
       }}
     >
       {children}
@@ -216,9 +211,7 @@ export const AuthProvider = ({ children }) => {
   );
 };
 
-// --------------------------------------------------
 // Custom hook
-// --------------------------------------------------
 export const useAuth = () => {
   const context = useContext(AuthContext);
 

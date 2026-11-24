@@ -103,7 +103,6 @@ def _build_local_fallback_analysis(text):
         'address',
         'impression',
     }
-
     pattern_with_reference = re.compile(
         r"""
         ^\s*
@@ -111,7 +110,7 @@ def _build_local_fallback_analysis(text):
         \s*:\s*
         (?P<value>-?\d+(?:\.\d+)?)
         \s*
-        (?P<unit>[^ (\n]*?(?:\s*[^ (\n]+)?)?)
+        (?P<unit>[^(\n]*?)
         \s*
         \(
         \s*
@@ -121,12 +120,13 @@ def _build_local_fallback_analysis(text):
         \s*[-–—]\s*
         (?P<high>-?\d+(?:\.\d+)?)
         \s*
-        (?P<ref_unit>[^)]*)
+        (?P<ref_unit>[^)\n]*)
         \)
         \s*$
         """,
         re.IGNORECASE | re.VERBOSE,
     )
+
 
     pattern_simple = re.compile(
         r"""

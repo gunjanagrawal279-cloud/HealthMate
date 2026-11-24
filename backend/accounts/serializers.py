@@ -1,10 +1,14 @@
+
 from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 
 
 class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, validators=[validate_password])
+    password = serializers.CharField(
+        write_only=True,
+        validators=[validate_password]
+    )
 
     class Meta:
         model = User
@@ -20,6 +24,19 @@ class RegisterSerializer(serializers.ModelSerializer):
 
 
 class UserSerializer(serializers.ModelSerializer):
+    role = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ('id', 'username', 'email')
+        fields = ('id', 'username', 'email', 'role')
+
+    def get_role(self, obj):
+        if obj.is_superuser:
+            return 'admin'
+
+        doctor = getattr(obj, 'doctor_profile', None)
+
+        if doctor and doctor.verified:
+            return 'doctor'
+
+        return 'patient'
